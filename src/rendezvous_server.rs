@@ -1,4 +1,5 @@
 use crate::common::*;
+use crate::jwt;
 use crate::peer::*;
 use hbb_common::{
     allow_err, bail,
@@ -13,7 +14,7 @@ use hbb_common::{
     log,
     protobuf::{Message as _, MessageField},
     rendezvous_proto::{
-        register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
+        register_pk_response::Result::{INVALID_ID_FORMAT, TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
     tcp::{listen_any, FramedStream},
@@ -54,12 +55,28 @@ enum Sink {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
 }
+
+impl Sink {
+    async fn send(&mut self, msg: &RendezvousMessage) {
+        if let Ok(bytes) = msg.write_to_bytes() {
+            match self {
+                Sink::TcpStream(s) => {
+                    allow_err!(s.send(Bytes::from(bytes)).await);
+                }
+                Sink::Ws(ws) => {
+                    allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
+                }
+            }
+        }
+    }
+}
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -88,6 +105,7 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    ws_map: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
 }
 
 enum LoopFailure {
@@ -142,6 +160,7 @@ impl RendezvousServer {
                 mask,
                 local_ip,
             }),
+            ws_map: Arc::new(Mutex::new(HashMap::new())),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -161,6 +180,24 @@ impl RendezvousServer {
         log::info!(
             "ALWAYS_USE_RELAY={}",
             if ALWAYS_USE_RELAY.load(Ordering::SeqCst) {
+                "Y"
+            } else {
+                "N"
+            }
+        );
+        let must_login = get_arg("must-login");
+        if must_login.to_uppercase() == "Y"
+            || (must_login.is_empty()
+                && std::env::var("MUST_LOGIN")
+                    .unwrap_or_default()
+                    .to_uppercase()
+                    == "Y")
+        {
+            MUST_LOGIN.store(true, Ordering::SeqCst);
+        }
+        log::info!(
+            "MUST_LOGIN={}",
+            if MUST_LOGIN.load(Ordering::SeqCst) {
                 "Y"
             } else {
                 "N"
@@ -327,7 +364,13 @@ impl RendezvousServer {
                     // B registered
                     if !rp.id.is_empty() {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
-                        self.update_addr(rp.id, addr, socket).await?;
+                        let request_pk = self.update_addr(rp.id, addr).await;
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_peer_response(RegisterPeerResponse {
+                            request_pk,
+                            ..Default::default()
+                        });
+                        socket.send(&msg_out, addr).await?;
                         if self.inner.serial > rp.serial {
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_configure_update(ConfigUpdate {
@@ -490,6 +533,28 @@ impl RendezvousServer {
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    if !rp.id.is_empty() {
+                        log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
+                        let request_pk = self.update_addr(rp.id, addr).await;
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_peer_response(RegisterPeerResponse {
+                            request_pk,
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, msg_out).await;
+                        if self.inner.serial > rp.serial {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_configure_update(ConfigUpdate {
+                                serial: self.inner.serial,
+                                rendezvous_servers: (*self.rendezvous_servers).clone(),
+                                ..Default::default()
+                            });
+                            Self::send_to_sink(sink, msg_out).await;
+                        }
+                    }
+                    return true;
+                }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
@@ -553,14 +618,32 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    let res = match self.handle_register_pk(rk, addr, ws).await {
+                        Ok(res) | Err(res) => res,
+                    };
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
                         result: res.into(),
                         ..Default::default()
                     });
                     Self::send_to_sink(sink, msg_out).await;
+                    if res == register_pk_response::Result::OK && ws {
+                        if let Some(sink) = sink.take() {
+                            self.ws_map.lock().await.insert(try_into_v4(addr), sink);
+                        }
+                    }
+                    return res == register_pk_response::Result::OK;
+                }
+                Some(rendezvous_message::Union::OnlineRequest(or)) => {
+                    let states = self.peers_online_state(or.peers).await;
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_online_response(OnlineResponse {
+                        states: states.into(),
+                        ..Default::default()
+                    });
+                    Self::send_to_sink(sink, msg_out).await;
+                    return true;
                 }
                 _ => {}
             }
@@ -569,12 +652,7 @@ impl RendezvousServer {
     }
 
     #[inline]
-    async fn update_addr(
-        &mut self,
-        id: String,
-        socket_addr: SocketAddr,
-        socket: &mut FramedSocket,
-    ) -> ResultType<()> {
+    async fn update_addr(&mut self, id: String, socket_addr: SocketAddr) -> bool {
         let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(&id).await {
             let mut old = old.write().await;
             let ip = socket_addr.ip();
@@ -604,12 +682,93 @@ impl RendezvousServer {
         if let Some(old) = ip_change {
             log::info!("IP change of {} from {} to {}", id, old, socket_addr);
         }
-        let mut msg_out = RendezvousMessage::new();
-        msg_out.set_register_peer_response(RegisterPeerResponse {
-            request_pk,
-            ..Default::default()
-        });
-        socket.send(&msg_out, socket_addr).await
+        request_pk
+    }
+
+    async fn handle_register_pk(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+        refresh_existing: bool,
+    ) -> Result<register_pk_response::Result, register_pk_response::Result> {
+        if rk.uuid.is_empty() || rk.pk.is_empty() {
+            return Err(INVALID_ID_FORMAT);
+        }
+        let id = rk.id;
+        let ip = addr.ip().to_string();
+        if id.len() < 6 {
+            return Err(UUID_MISMATCH);
+        } else if !self.check_ip_blocker(&ip, &id).await {
+            return Err(TOO_FREQUENT);
+        }
+        let peer = self.pm.get_or(&id).await;
+        let (changed, ip_changed) = {
+            let peer = peer.read().await;
+            if peer.uuid.is_empty() {
+                (true, false)
+            } else {
+                if peer.uuid == rk.uuid {
+                    if peer.info.ip != ip && peer.pk != rk.pk {
+                        log::warn!(
+                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                            id,
+                            ip,
+                            rk.pk,
+                            peer.info.ip,
+                            peer.pk,
+                        );
+                        drop(peer);
+                        return Err(UUID_MISMATCH);
+                    }
+                } else {
+                    log::warn!(
+                        "Peer {} uuid mismatch: {:?} vs {:?}",
+                        id,
+                        rk.uuid,
+                        peer.uuid
+                    );
+                    drop(peer);
+                    return Err(UUID_MISMATCH);
+                }
+                let ip_changed = peer.info.ip != ip;
+                (
+                    peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
+                    ip_changed,
+                )
+            }
+        };
+        let mut req_pk = peer.read().await.reg_pk;
+        if req_pk.1.elapsed().as_secs() > 6 {
+            req_pk.0 = 0;
+        } else if req_pk.0 > 2 {
+            return Err(TOO_FREQUENT);
+        }
+        req_pk.0 += 1;
+        req_pk.1 = Instant::now();
+        peer.write().await.reg_pk = req_pk;
+        if ip_changed {
+            let mut lock = IP_CHANGES.lock().await;
+            if let Some((tm, ips)) = lock.get_mut(&id) {
+                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                    *tm = Instant::now();
+                    ips.clear();
+                    ips.insert(ip.clone(), 1);
+                } else if let Some(v) = ips.get_mut(&ip) {
+                    *v += 1;
+                } else {
+                    ips.insert(ip.clone(), 1);
+                }
+            } else {
+                lock.insert(
+                    id.clone(),
+                    (Instant::now(), HashMap::from([(ip.clone(), 1)])),
+                );
+            }
+        }
+        if changed || refresh_existing {
+            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+        }
+        Ok(register_pk_response::Result::OK)
     }
 
     #[inline]
@@ -692,6 +851,14 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        if let Some(other_failure) = Self::login_failure_message(&ph.token) {
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure,
                 ..Default::default()
             });
             return Ok((msg_out, None));
@@ -789,12 +956,39 @@ impl RendezvousServer {
         }
     }
 
+    fn login_failure_message(token: &str) -> Option<String> {
+        if !MUST_LOGIN.load(Ordering::SeqCst) {
+            return None;
+        }
+        if jwt::secret().is_empty() {
+            return Some("JWT secret is not configured".to_owned());
+        }
+        if token.is_empty() {
+            return Some("Connection failed, please login!".to_owned());
+        }
+        jwt::verify_token(token)
+            .err()
+            .map(|_| "Token error, please log out and log back in!".to_owned())
+    }
+
     #[inline]
     async fn handle_online_request(
         &mut self,
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
+        let states = self.peers_online_state(peers).await;
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_online_response(OnlineResponse {
+            states: states.into(),
+            ..Default::default()
+        });
+        stream.send(&msg_out).await?;
+
+        Ok(())
+    }
+
+    async fn peers_online_state(&mut self, peers: Vec<String>) -> BytesMut {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
@@ -807,15 +1001,7 @@ impl RendezvousServer {
                 }
             }
         }
-
-        let mut msg_out = RendezvousMessage::new();
-        msg_out.set_online_response(OnlineResponse {
-            states: states.into(),
-            ..Default::default()
-        });
-        stream.send(&msg_out).await?;
-
-        Ok(())
+        states
     }
 
     #[inline]
@@ -829,16 +1015,7 @@ impl RendezvousServer {
     #[inline]
     async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
         if let Some(sink) = sink.as_mut() {
-            if let Ok(bytes) = msg.write_to_bytes() {
-                match sink {
-                    Sink::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
-                    }
-                    Sink::Ws(ws) => {
-                        allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
-                    }
-                }
-            }
+            sink.send(&msg).await;
         }
     }
 
@@ -863,7 +1040,12 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+            let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
+            if let Some(sink) = sink.as_mut() {
+                sink.send(&msg).await;
+            } else {
+                self.tx.send(Data::Msg(msg.into(), addr))?;
+            }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -942,14 +1124,15 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
                     "punch-requests(pr) [<number>] [-]",
-                    "always-use-relay(aur)",
-                    "test-geo(tg) <ip1> <ip2>"
+                    "always-use-relay(aur) [Y|N]",
+                    "test-geo(tg) <ip1> <ip2>",
+                    "must-login(ml) [Y|N]"
                 )
             }
             Some("relay-servers" | "rs") => {
@@ -1053,7 +1236,7 @@ impl RendezvousServer {
                 let arg = fds.next();
                 if let Some("-") = arg { lock.clear(); }
                 else {
-                    let mut start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                    let start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
                     let mut page_size = fds.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
                     if page_size == 0 { page_size = 10; }
                     for (_, e) in lock.iter().enumerate().skip(start).take(page_size) {
@@ -1092,6 +1275,13 @@ impl RendezvousServer {
                             res = format!("{:?}", self.get_relay_server(a, a));
                         }
                     }
+                }
+            }
+            Some("must-login" | "ml") => {
+                if let Some(value) = fds.next() {
+                    MUST_LOGIN.store(value.to_uppercase() == "Y", Ordering::SeqCst);
+                } else {
+                    let _ = writeln!(res, "MUST_LOGIN: {:?}", MUST_LOGIN.load(Ordering::SeqCst));
                 }
             }
             _ => {}
@@ -1195,6 +1385,7 @@ impl RendezvousServer {
         }
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+            self.ws_map.lock().await.remove(&try_into_v4(addr));
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())

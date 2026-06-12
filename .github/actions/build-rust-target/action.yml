@@ -1,0 +1,44 @@
+name: Build Rust target
+description: Install a Rust toolchain and build release binaries for one target.
+
+inputs:
+  target:
+    description: Rust target triple.
+    required: true
+  toolchain:
+    description: Rust toolchain version.
+    required: true
+  use-cross:
+    description: Use cross instead of cargo for the build.
+    required: false
+    default: "false"
+  working-directory:
+    description: Directory where cargo or cross should run.
+    required: false
+    default: "."
+
+runs:
+  using: composite
+  steps:
+    - name: Install toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: rustfmt
+        targets: ${{ inputs.target }}
+
+    - name: Install cross
+      if: inputs.use-cross == 'true'
+      uses: taiki-e/install-action@cross
+
+    - name: Build with cross
+      if: inputs.use-cross == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: cross build --release --all-features --target=${{ inputs.target }}
+
+    - name: Build with cargo
+      if: inputs.use-cross != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: cargo build --release --all-features --target=${{ inputs.target }}

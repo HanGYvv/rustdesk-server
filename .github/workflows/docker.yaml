@@ -1,0 +1,310 @@
+name: docker
+
+# Required repository secrets:
+# DOCKER_HUB_USERNAME is the Docker Hub username.
+# DOCKER_HUB_PASSWORD is a Docker Hub token with read/write access.
+
+permissions:
+  contents: read
+  packages: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag to build, for example v1.2.3.
+        required: true
+        type: string
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-[0-9]+"
+
+env:
+  CARGO_TERM_COLOR: always
+  LATEST_TAG: latest
+  RUST_TOOLCHAIN: "1.90"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PROJECT_URL: https://github.com/${{ github.repository }}
+  DOCUMENTATION_URL: https://github.com/${{ github.repository }}#installation
+  DOCKER_IMAGE: hangyvv/rustdesk-server-s6
+  DOCKER_IMAGE_CLASSIC: hangyvv/rustdesk-server
+  GHCR_IMAGE: ghcr.io/hangyvv/rustdesk-server-s6
+  GHCR_IMAGE_CLASSIC: ghcr.io/hangyvv/rustdesk-server
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-22.04
+    outputs:
+      release-tag: ${{ steps.version.outputs.release-tag }}
+      major-tag: ${{ steps.version.outputs.major-tag }}
+
+    steps:
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.version }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "${tag}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            echo "Invalid release tag: ${tag}" >&2
+            exit 1
+          fi
+
+          normalized="${tag#v}"
+          major="${normalized%%.*}"
+
+          echo "release-tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "major-tag=${major}" >> "${GITHUB_OUTPUT}"
+
+  build-linux:
+    name: Build Linux - ${{ matrix.job.name }}
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64", target: "x86_64-unknown-linux-musl" }
+          - { name: "arm64v8", target: "aarch64-unknown-linux-musl" }
+          - { name: "armv7", target: "armv7-unknown-linux-musleabihf" }
+          - { name: "i386", target: "i686-unknown-linux-musl" }
+
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v6
+
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          path: source
+          submodules: recursive
+
+      - name: Build Rust binaries
+        uses: ./.github/actions/build-rust-target
+        with:
+          target: ${{ matrix.job.target }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          use-cross: "true"
+          working-directory: source
+
+      - name: Make binaries executable
+        run: chmod -v a+x source/target/${{ matrix.job.target }}/release/*
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: |
+            source/target/${{ matrix.job.target }}/release/hbbr
+            source/target/${{ matrix.job.target }}/release/hbbs
+            source/target/${{ matrix.job.target }}/release/rustdesk-utils
+          if-no-files-found: error
+
+  docker:
+    name: Docker S6 - ${{ matrix.job.name }}
+    needs:
+      - prepare
+      - build-linux
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64", docker_platform: "linux/amd64", s6_platform: "x86_64" }
+          - { name: "arm64v8", docker_platform: "linux/arm64", s6_platform: "aarch64" }
+          - { name: "armv7", docker_platform: "linux/arm/v7", s6_platform: "armhf" }
+          - { name: "i386", docker_platform: "linux/386", s6_platform: "i686" }
+
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v6
+
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          path: source
+          submodules: recursive
+
+      - name: Build and push Docker image
+        uses: ./.github/actions/docker-build-and-push
+        with:
+          artifact-name: binaries-linux-${{ matrix.job.name }}
+          artifact-path: source/docker/rootfs/usr/bin
+          context: ./source/docker
+          docker-platform: ${{ matrix.job.docker_platform }}
+          docker-hub-image: ${{ env.DOCKER_IMAGE }}
+          ghcr-image: ${{ env.GHCR_IMAGE }}
+          image-title: RustDesk Server S6
+          image-description: Self-hosted RustDesk container image with s6-overlay and supervised services.
+          project-url: ${{ env.PROJECT_URL }}
+          documentation-url: ${{ env.DOCUMENTATION_URL }}
+          arch-name: ${{ matrix.job.name }}
+          s6-arch: ${{ matrix.job.s6_platform }}
+          version-tag: ${{ needs.prepare.outputs.release-tag }}
+          major-tag: ${{ needs.prepare.outputs.major-tag }}
+          latest-tag: ${{ env.LATEST_TAG }}
+          docker-hub-username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          docker-hub-password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+          ghcr-username: ${{ github.repository_owner }}
+          ghcr-token: ${{ secrets.GITHUB_TOKEN }}
+
+  docker-classic:
+    name: Docker classic - ${{ matrix.job.name }}
+    needs:
+      - prepare
+      - build-linux
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64", docker_platform: "linux/amd64" }
+          - { name: "arm64v8", docker_platform: "linux/arm64" }
+          - { name: "armv7", docker_platform: "linux/arm/v7" }
+
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v6
+
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          path: source
+          submodules: recursive
+
+      - name: Build and push Docker image
+        uses: ./.github/actions/docker-build-and-push
+        with:
+          artifact-name: binaries-linux-${{ matrix.job.name }}
+          artifact-path: source/docker-classic
+          context: ./source/docker-classic
+          docker-platform: ${{ matrix.job.docker_platform }}
+          docker-hub-image: ${{ env.DOCKER_IMAGE_CLASSIC }}
+          ghcr-image: ${{ env.GHCR_IMAGE_CLASSIC }}
+          image-title: RustDesk Server
+          image-description: Self-hosted RustDesk container image for hbbs and hbbr.
+          project-url: ${{ env.PROJECT_URL }}
+          documentation-url: ${{ env.DOCUMENTATION_URL }}
+          arch-name: ${{ matrix.job.name }}
+          version-tag: ${{ needs.prepare.outputs.release-tag }}
+          major-tag: ${{ needs.prepare.outputs.major-tag }}
+          latest-tag: ${{ env.LATEST_TAG }}
+          docker-hub-username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          docker-hub-password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+          ghcr-username: ${{ github.repository_owner }}
+          ghcr-token: ${{ secrets.GITHUB_TOKEN }}
+
+  docker-manifest:
+    name: Docker manifest - s6
+    needs:
+      - prepare
+      - docker
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          path: source
+
+      - name: Create Docker manifests
+        uses: ./.github/actions/docker-manifest
+        with:
+          docker-hub-image: ${{ env.DOCKER_IMAGE }}
+          ghcr-image: ${{ env.GHCR_IMAGE }}
+          source-path: source
+          image-title: RustDesk Server S6
+          image-description: Self-hosted RustDesk container image with s6-overlay and supervised services.
+          project-url: ${{ env.PROJECT_URL }}
+          documentation-url: ${{ env.DOCUMENTATION_URL }}
+          arch-suffixes: amd64 arm64v8 armv7 i386
+          version-tag: ${{ needs.prepare.outputs.release-tag }}
+          major-tag: ${{ needs.prepare.outputs.major-tag }}
+          latest-tag: ${{ env.LATEST_TAG }}
+          docker-hub-username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          docker-hub-password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+          ghcr-username: ${{ github.repository_owner }}
+          ghcr-token: ${{ secrets.GITHUB_TOKEN }}
+
+  docker-manifest-classic:
+    name: Docker manifest - classic
+    needs:
+      - prepare
+      - docker-classic
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          path: source
+
+      - name: Create Docker manifests
+        uses: ./.github/actions/docker-manifest
+        with:
+          docker-hub-image: ${{ env.DOCKER_IMAGE_CLASSIC }}
+          ghcr-image: ${{ env.GHCR_IMAGE_CLASSIC }}
+          source-path: source
+          image-title: RustDesk Server
+          image-description: Self-hosted RustDesk container image for hbbs and hbbr.
+          project-url: ${{ env.PROJECT_URL }}
+          documentation-url: ${{ env.DOCUMENTATION_URL }}
+          arch-suffixes: amd64 arm64v8 armv7
+          version-tag: ${{ needs.prepare.outputs.release-tag }}
+          major-tag: ${{ needs.prepare.outputs.major-tag }}
+          latest-tag: ${{ env.LATEST_TAG }}
+          docker-hub-username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          docker-hub-password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+          ghcr-username: ${{ github.repository_owner }}
+          ghcr-token: ${{ secrets.GITHUB_TOKEN }}
+
+  dockerhub-description:
+    name: Docker Hub description
+    needs:
+      - prepare
+      - docker-manifest
+      - docker-manifest-classic
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          path: source
+          submodules: recursive
+
+      - name: Update Docker Hub description - S6
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+          repository: ${{ env.DOCKER_IMAGE }}
+          short-description: Self-hosted RustDesk container image with s6-overlay.
+          readme-filepath: ./source/docker/README.md
+
+      - name: Update Docker Hub description - Classic
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+          repository: ${{ env.DOCKER_IMAGE_CLASSIC }}
+          short-description: Self-hosted RustDesk container image for hbbs and hbbr.
+          readme-filepath: ./source/docker-classic/README.md

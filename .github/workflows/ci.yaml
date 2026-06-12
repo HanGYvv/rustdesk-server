@@ -1,0 +1,68 @@
+name: ci
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.90"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Check Rust workspace
+        run: cargo check --workspace --all-features
+
+  docker:
+    name: Docker build checks
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Prepare Docker smoke-test binaries
+        run: |
+          touch docker/rootfs/usr/bin/hbbs docker/rootfs/usr/bin/hbbr docker/rootfs/usr/bin/rustdesk-utils
+          chmod +x docker/rootfs/usr/bin/hbbs docker/rootfs/usr/bin/hbbr docker/rootfs/usr/bin/rustdesk-utils
+          touch docker-classic/hbbs docker-classic/hbbr
+          chmod +x docker-classic/hbbs docker-classic/hbbr
+
+      - name: Check S6 Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./docker
+          push: false
+          provenance: false
+          build-args: |
+            S6_ARCH=x86_64
+
+      - name: Check classic Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./docker-classic
+          push: false
+          provenance: false

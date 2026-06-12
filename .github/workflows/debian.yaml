@@ -1,0 +1,152 @@
+name: debian
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag to build, for example v1.2.3.
+        required: true
+        type: string
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-[0-9]+"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.90"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-22.04
+    outputs:
+      release-tag: ${{ steps.version.outputs.release-tag }}
+
+    steps:
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.version }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "${tag}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            echo "Invalid release tag: ${tag}" >&2
+            exit 1
+          fi
+
+          echo "release-tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+  build-linux:
+    name: Build Linux - ${{ matrix.job.name }}
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64", target: "x86_64-unknown-linux-musl" }
+          - { name: "arm64v8", target: "aarch64-unknown-linux-musl" }
+          - { name: "armv7", target: "armv7-unknown-linux-musleabihf" }
+          - { name: "i386", target: "i686-unknown-linux-musl" }
+
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v6
+
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          path: source
+          submodules: recursive
+
+      - name: Build Rust binaries
+        uses: ./.github/actions/build-rust-target
+        with:
+          target: ${{ matrix.job.target }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          use-cross: "true"
+          working-directory: source
+
+      - name: Make binaries executable
+        run: chmod -v a+x source/target/${{ matrix.job.target }}/release/*
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: |
+            source/target/${{ matrix.job.target }}/release/hbbr
+            source/target/${{ matrix.job.target }}/release/hbbs
+            source/target/${{ matrix.job.target }}/release/rustdesk-utils
+          if-no-files-found: error
+
+  deb-package:
+    name: Debian package - ${{ matrix.job.name }}
+    needs:
+      - prepare
+      - build-linux
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64", debian_platform: "amd64", crossbuild_package: "" }
+          - { name: "arm64v8", debian_platform: "arm64", crossbuild_package: "crossbuild-essential-arm64" }
+          - { name: "armv7", debian_platform: "armhf", crossbuild_package: "crossbuild-essential-armhf" }
+          - { name: "i386", debian_platform: "i386", crossbuild_package: "crossbuild-essential-i386" }
+
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v6
+
+      - name: Checkout release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.release-tag }}
+          path: source
+          submodules: recursive
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Create packaging env
+        run: |
+          sudo apt update
+          DEBIAN_FRONTEND=noninteractive sudo apt install -y devscripts build-essential debhelper pkg-config ${{ matrix.job.crossbuild_package }}
+          mkdir -p source/debian-build/${{ matrix.job.name }}/bin
+
+      - name: Download binaries
+        uses: actions/download-artifact@v6
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: source/debian-build/${{ matrix.job.name }}/bin
+
+      - name: Build package
+        run: |
+          chmod -v a+x source/debian-build/${{ matrix.job.name }}/bin/*
+          cp -vr source/debian source/systemd source/debian-build/${{ matrix.job.name }}/
+          sed 's/{{ ARCH }}/${{ matrix.job.debian_platform }}/' source/debian/control.tpl > source/debian-build/${{ matrix.job.name }}/debian/control
+          cd source/debian-build/${{ matrix.job.name }}/
+          debuild -i -us -uc -b -a${{ matrix.job.debian_platform }}
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          tag_name: ${{ needs.prepare.outputs.release-tag }}
+          files: |
+            source/debian-build/rustdesk-server-hbbr_*_${{ matrix.job.debian_platform }}.deb
+            source/debian-build/rustdesk-server-hbbs_*_${{ matrix.job.debian_platform }}.deb
+            source/debian-build/rustdesk-server-utils_*_${{ matrix.job.debian_platform }}.deb

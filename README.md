@@ -1,8 +1,13 @@
 # RustDesk Server Program
 
-[![build](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml)
+[![version](https://img.shields.io/github/v/tag/HanGYvv/rustdesk-server?label=version)](https://github.com/HanGYvv/rustdesk-server/releases)
+[![license](https://img.shields.io/github/license/HanGYvv/rustdesk-server)](LICENSE)
+[![ci](https://github.com/HanGYvv/rustdesk-server/actions/workflows/ci.yaml/badge.svg)](https://github.com/HanGYvv/rustdesk-server/actions/workflows/ci.yaml)
+[![docker](https://github.com/HanGYvv/rustdesk-server/actions/workflows/docker.yaml/badge.svg)](https://github.com/HanGYvv/rustdesk-server/actions/workflows/docker.yaml)
+[![release](https://github.com/HanGYvv/rustdesk-server/actions/workflows/release.yaml/badge.svg)](https://github.com/HanGYvv/rustdesk-server/actions/workflows/release.yaml)
+[![debian](https://github.com/HanGYvv/rustdesk-server/actions/workflows/debian.yaml/badge.svg)](https://github.com/HanGYvv/rustdesk-server/actions/workflows/debian.yaml)
 
-[**Download**](https://github.com/rustdesk/rustdesk-server/releases)
+[**Download**](https://github.com/HanGYvv/rustdesk-server/releases)
 
 [**Manual**](https://rustdesk.com/docs/en/self-host/)
 
@@ -31,7 +36,7 @@ Three executables will be generated in target/release.
 - hbbr - RustDesk relay server
 - rustdesk-utils - RustDesk CLI utilities
 
-You can find updated binaries on the [Releases](https://github.com/rustdesk/rustdesk-server/releases) page.
+You can find updated binaries on the [Releases](https://github.com/HanGYvv/rustdesk-server/releases) page.
 
 ## Configuration
 

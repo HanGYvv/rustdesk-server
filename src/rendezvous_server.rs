@@ -597,7 +597,7 @@ impl RendezvousServer {
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        self.send_to_peer(msg_out, peer_addr).await;
                     }
                     return true;
                 }
@@ -1054,6 +1054,19 @@ impl RendezvousServer {
         Ok(())
     }
 
+    async fn send_to_peer(&mut self, msg: RendezvousMessage, peer_addr: SocketAddr) {
+        let key = try_into_v4(peer_addr);
+        let mut sink = self.ws_map.lock().await.remove(&key);
+        if sink.is_none() {
+            sink = self.tcp_punch.lock().await.remove(&key);
+        }
+        if let Some(sink) = sink.as_mut() {
+            sink.send(&msg).await;
+        } else {
+            self.tx.send(Data::Msg(msg.into(), peer_addr)).ok();
+        }
+    }
+
     #[inline]
     async fn handle_tcp_punch_hole_request(
         &mut self,
@@ -1064,12 +1077,7 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
-            let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
-            if let Some(sink) = sink.as_mut() {
-                sink.send(&msg).await;
-            } else {
-                self.tx.send(Data::Msg(msg.into(), addr))?;
-            }
+            self.send_to_peer(msg, addr).await;
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }

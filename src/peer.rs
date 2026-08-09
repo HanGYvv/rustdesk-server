@@ -102,7 +102,9 @@ impl PeerMap {
         log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
         let (info_str, guid) = {
             let mut w = peer.write().await;
-            w.socket_addr = addr;
+            if addr.port() != 0 || w.socket_addr.port() == 0 {
+                w.socket_addr = addr;
+            }
             w.uuid = uuid.clone();
             w.pk = pk.clone();
             w.last_reg_time = Instant::now();

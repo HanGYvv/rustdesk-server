@@ -687,7 +687,9 @@ impl RendezvousServer {
             } && !ip.is_loopback();
             let request_pk = old.pk.is_empty() || ip_change;
             if !request_pk {
-                old.socket_addr = socket_addr;
+                if socket_addr.port() != 0 || old.socket_addr.port() == 0 {
+                    old.socket_addr = socket_addr;
+                }
                 old.last_reg_time = Instant::now();
             }
             let ip_change = if ip_change && old.reg_pk.0 <= 2 {

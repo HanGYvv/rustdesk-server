@@ -63,9 +63,16 @@ reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocki
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocking", "socks", "json", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
+# hbb_common pulls in native-tls -> openssl-sys on all platforms; build OpenSSL
+# from source so static musl cross-builds (cross images have no system OpenSSL).
+openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.build-dependencies]
+# build.rs depends on hbb_common, which is compiled for the host as well.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [workspace]
 members = ["libs/hbb_common"]

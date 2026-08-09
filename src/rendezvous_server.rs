@@ -314,8 +314,7 @@ impl RendezvousServer {
                     match res {
                         Some(Ok((bytes, addr))) => {
                             if let Err(err) = self.handle_udp(&bytes, addr.into(), socket, key).await {
-                                log::error!("udp failure: {}", err);
-                                return LoopFailure::UdpSocket;
+                                log::warn!("udp send/process failure (ignored): {}", err);
                             }
                         }
                         Some(Err(err)) => {
@@ -387,6 +386,10 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> ResultType<()> {
+        if addr.port() == 0 {
+            log::debug!("drop UDP packet from source port 0: {}", addr);
+            return Ok(());
+        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
